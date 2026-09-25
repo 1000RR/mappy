@@ -1,0 +1,13 @@
+node_modules/
+dist/
+dist-server/
+.DS_Store
+.env
+data/maps/
+data/graph/
+data/source/
+data/manifest.json
+data/search.json
+data/search.sqlite
+data/search.sqlite.tmp
+*.log
