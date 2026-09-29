@@ -1,3 +1,6 @@
+<img width="2440" height="1690" alt="mappy" align="center" src="https://github.com/user-attachments/assets/c1651b11-43ae-4047-8a7d-26bb422d4227" />
+
+
 # Mappy
 
 A private, offline-ready route planner. The currently installed data covers the Bay Area. React and MapLibre run in the browser; NestJS serves the app, map packages, and address search. Route coordinates are handled locally by `valhalla-browser`.
