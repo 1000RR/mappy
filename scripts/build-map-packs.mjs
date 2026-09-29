@@ -1,6 +1,7 @@
 import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
-import { basename, join, resolve } from 'node:path'
+import { join, resolve } from 'node:path'
+import { createHash } from 'node:crypto'
 
 const project = resolve(import.meta.dirname, '..')
 const data = resolve(project, 'data')
@@ -8,10 +9,15 @@ const maps = join(data, 'maps')
 const graph = join(data, 'graph')
 const source = process.env.PMTILES_SOURCE
 const binary = process.env.PMTILES_BIN ?? 'pmtiles'
-const bounds = [-123.15, 36.88, -121.38, 38.88]
+const previous = await readFile(join(data, 'manifest.json'), 'utf8').then(JSON.parse).catch(() => null)
+const bounds = process.env.AREA_BOUNDS?.split(',').map(Number) ?? previous?.bounds
+if (!Array.isArray(bounds) || bounds.length !== 4 || !bounds.every(Number.isFinite) || bounds[0] >= bounds[2] || bounds[1] >= bounds[3] || bounds[0] < -180 || bounds[2] > 180 || bounds[1] < -85 || bounds[3] > 85) {
+  throw new Error('Set AREA_BOUNDS=west,south,east,north (longitude ±180, latitude ±85)')
+}
+const areaId = `area-${createHash('sha256').update(bounds.join(',')).digest('hex').slice(0, 12)}`
 const miles = 15
 const latStep = miles / 69.0
-const lonStep = miles / (69.0 * Math.cos(37.85 * Math.PI / 180))
+const lonStep = miles / (69.0 * Math.cos((bounds[1] + bounds[3]) / 2 * Math.PI / 180))
 const only = process.env.ONLY_CELL
 
 if (!source) throw new Error('Set PMTILES_SOURCE to a local or remote Protomaps basemap archive')
@@ -28,7 +34,7 @@ function run(command, args) {
 const areas = []
 for (let row = 0, south = bounds[1]; south < bounds[3]; row++, south += latStep) {
   for (let col = 0, west = bounds[0]; west < bounds[2]; col++, west += lonStep) {
-    const id = `bay-r${row}-c${col}`
+    const id = `${areaId}-r${row}-c${col}`
     if (only && only !== id) continue
     const bbox = [west, south, Math.min(west + lonStep, bounds[2]), Math.min(south + latStep, bounds[3])]
     const filename = `${id}.pmtiles`

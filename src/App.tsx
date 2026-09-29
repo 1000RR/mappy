@@ -2,14 +2,17 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { Map as MaplibreMap } from 'maplibre-gl'
 import { Bike, CarFront, Check, ChevronDown, ChevronUp, Crosshair, Download, Footprints, Layers3, LocateFixed, Map as MapIcon, MoreHorizontal, Navigation, Plus, RotateCcw, Search, Settings2, Trash2, Undo2, Upload, X } from 'lucide-react'
 import { MapCanvas } from './components/MapCanvas'
+import { LocationPicker } from './components/LocationPicker'
+import { initialLocation, validCoordinate, searchAddresses, type SearchResult } from './lib/location'
 import { areaFor, ensureArea, graphReady, loadCachedAreas, loadManifest, resetData } from './lib/data'
 import { formatDistance, inBounds, intersects } from './lib/geo'
-import { calculateLegs, getRouter, releaseRouter, snapPoint, snapWaypoints } from './lib/routing'
+import { latestPreview } from './lib/latestPreview'
+import { updateLegsIncrementally } from './lib/legs'
+import { calculateLeg, calculateLegs, getRouter, releaseRouter, snapPoint, snapWaypoints } from './lib/routing'
 import { clearAllAppData, deleteRoute, getDraft, getLastLocation, getTheme, listRoutes, saveRoute, setDraft, setLastLocation, setTheme } from './lib/storage'
-import type { Coordinate, DataManifest, Leg, Mode, RouteDraft, SavedRoute, Theme, Waypoint } from './lib/types'
-import { BAY_BOUNDS, BAY_CENTER, EMPTY_DRAFT } from './lib/types'
+import type { Coordinate, DataManifest, Leg, Mode, RouteDraft, RoutePreview, SavedRoute, Theme, Waypoint } from './lib/types'
+import { EMPTY_DRAFT } from './lib/types'
 
-type SearchResult = { name: string; detail: string; lat: number; lon: number }
 type Viewport = { center: Coordinate; bounds: [number, number, number, number]; zoom: number }
 const modeOptions: Array<{ value: Mode; label: string; icon: typeof CarFront }> = [
   { value: 'auto', label: 'Drive', icon: CarFront },
@@ -34,7 +37,7 @@ function safeRoute(value: unknown): SavedRoute | null {
   if (!value || typeof value !== 'object') return null
   const route = value as Partial<SavedRoute> & { format?: string }
   if (route.format !== 'mappy-route-v1' || !Array.isArray(route.waypoints) || route.waypoints.length > 100 || !['auto', 'bicycle', 'pedestrian'].includes(route.mode ?? '')) return null
-  if (!route.waypoints.every((point) => point && Number.isFinite(point.original?.lat) && Number.isFinite(point.original?.lon) && inBounds(point.original, BAY_BOUNDS))) return null
+  if (!route.waypoints.every((point) => point && validCoordinate(point.original))) return null
   return { id: crypto.randomUUID(), name: String(route.name ?? 'Imported route').slice(0, 80), mode: route.mode!, waypoints: route.waypoints.map((point) => ({ id: crypto.randomUUID(), original: point.original, snapped: null })), savedAt: new Date().toISOString() }
 }
 
@@ -42,9 +45,12 @@ export default function App() {
   const [catalog, setCatalog] = useState<DataManifest | null>(null)
   const [draft, setRouteDraft] = useState<RouteDraft>(EMPTY_DRAFT)
   const [legs, setLegs] = useState<Leg[]>([])
+  const [routePreview, setRoutePreview] = useState<RoutePreview | null>(null)
+  const dragSession = useRef<ReturnType<typeof latestPreview<Coordinate, { draft: RouteDraft; legs: Leg[] }>> | null>(null)
+
   const [savedRoutes, setSavedRoutes] = useState<SavedRoute[]>([])
   const [theme, setMapTheme] = useState<Theme>('calm')
-  const [center, setCenter] = useState<Coordinate>(BAY_CENTER)
+  const [center, setCenter] = useState<Coordinate | null>(null)
   const [focusZoom, setFocusZoom] = useState(12.3)
   const [currentLocation, setCurrentLocation] = useState<Coordinate | null>(null)
   const [viewport, setViewport] = useState<Viewport | null>(null)
@@ -75,49 +81,53 @@ export default function App() {
   const draftRef = useRef(draft)
   const restoredRoute = useRef(false)
   draftRef.current = draft
-  const totalKm = legs.reduce((sum, leg) => sum + leg.distanceKm, 0)
-  const coverageBounds = catalog?.bounds ?? BAY_BOUNDS
+  const totalKm = (routePreview?.legs ?? legs).reduce((sum, leg) => sum + leg.distanceKm, 0)
+  const [locating, setLocating] = useState(true)
+  const [locationPickerOpen, setLocationPickerOpen] = useState(false)
+  const [searchError, setSearchError] = useState('')
+
+  const selectLocation = useCallback((point: Coordinate, zoom = 12.5) => {
+    setCenter({ lat: point.lat, lon: point.lon })
+    setFocusZoom(zoom)
+    setLocationPickerOpen(false)
+    setNotice(null)
+    void setLastLocation(point).catch(() => setNotice('This browser could not remember your location.'))
+  }, [])
 
   useEffect(() => {
     let active = true
     void (async () => {
-      const locationPromise = getPosition().then((point) => ({ point }), () => ({ point: null }))
-      const [savedDraft, savedTheme, lastLocation, routes] = await Promise.all([getDraft(), getTheme(), getLastLocation(), listRoutes()])
+      const locationPromise = getPosition().catch(() => null)
+      const catalogPromise = loadManifest().then(async (data) => {
+        const [ready, graphAvailable] = await Promise.all([loadCachedAreas(data), graphReady(data)])
+        if (!active) return
+        setCatalog(data)
+        setReadyAreas(ready)
+        setRoutingReady(graphAvailable)
+      }).catch(() => { if (active) setNotice('Map catalog is unavailable. Connect to this app’s server to load map data.') })
+      const [savedDraft, savedTheme, lastLocation, routes, point] = await Promise.all([
+        getDraft().catch(() => null), getTheme().catch(() => null), getLastLocation().catch(() => null), listRoutes().catch(() => []), locationPromise
+      ])
       if (!active) return
       if (savedDraft) setRouteDraft(savedDraft)
       if (savedTheme) setMapTheme(savedTheme)
       setHydrated(true)
       setSavedRoutes(routes)
-      if (lastLocation) setCenter(lastLocation.point)
-      try {
-        const data = await loadManifest()
-        if (!active) return
-        setCatalog(data)
-        setReadyAreas(await loadCachedAreas(data))
-        setRoutingReady(await graphReady(data))
-      } catch {
-        setNotice('Map catalog is unavailable. Start the NestJS server to load map data.')
-      }
-      const { point } = await locationPromise
-      if (point) {
-        if (!active) return
-        setCurrentLocation(point)
-        setCenter(point)
-        setFocusZoom(12.5)
-        await setLastLocation(point)
-        if (!inBounds(point, coverageBounds)) setNotice('Your location is outside the current Bay Area coverage. Search within the Bay Area to plan a route.')
-      } else {
-        if (!lastLocation && active) setNotice('Location is unavailable. Search for a Bay Area address or move the map to begin.')
-      }
+      const startingPoint = initialLocation(point, lastLocation?.point)
+      if (point) setCurrentLocation(point)
+      if (startingPoint) selectLocation(startingPoint)
+      else setLocationPickerOpen(true)
+      setLocating(false)
+      await catalogPromise
     })()
     return () => { active = false }
-  }, [])
+  }, [selectLocation])
 
   useEffect(() => { if (hydrated && autoDownload.current) void setDraft(draft) }, [draft, hydrated])
   useEffect(() => { if (hydrated && autoDownload.current) void setTheme(theme); document.documentElement.dataset.theme = theme }, [theme, hydrated])
 
   useEffect(() => {
-    if (!catalog || !viewport || !autoDownload.current || catalog.areas.length === 0) return
+    if (!center || !catalog || !viewport || !autoDownload.current || catalog.areas.length === 0) return
     const visible = catalog.areas.filter((area) => intersects(area.bbox, viewport.bounds))
     const selected = viewport.zoom < 10 ? [areaFor(viewport.center, catalog)].filter(Boolean) : visible.slice(0, 4)
     for (const area of selected) {
@@ -135,23 +145,39 @@ export default function App() {
       areaDownloads.current.set(area.id, { controller, task })
       break
     }
-  }, [catalog, viewport, readyAreas])
+  }, [catalog, center, viewport, readyAreas])
 
   useEffect(() => {
-    if (searchQuery.trim().length < 3) { setSearchResults([]); setSearching(false); return }
+    if (searchQuery.trim().length < 3) { setSearchResults([]); setSearching(false); setSearchError(''); return }
     const controller = new AbortController()
     const timeout = window.setTimeout(async () => {
       setSearching(true)
+      setSearchError('')
       try {
-        const response = await fetch(`/api/search?q=${encodeURIComponent(searchQuery.trim())}`, { signal: controller.signal })
-        if (!response.ok) throw new Error('Search unavailable')
-        const data = await response.json() as { results: SearchResult[] }
-        setSearchResults(data.results)
-      } catch { if (!controller.signal.aborted) setSearchResults([]) }
+        const results = await searchAddresses(searchQuery, controller.signal)
+        if (!controller.signal.aborted) { setSearchResults(results); if (!results.length) setSearchError('No matches in this server’s address data.') }
+      } catch (error) { if (!controller.signal.aborted) { setSearchResults([]); setSearchError(error instanceof Error ? error.message : 'Search unavailable') } }
       finally { if (!controller.signal.aborted) setSearching(false) }
     }, 300)
     return () => { controller.abort(); clearTimeout(timeout) }
   }, [searchQuery])
+
+  useEffect(() => {
+    if (!center || !catalog || !autoDownload.current) return
+    let active = true
+    const hasMap = !!areaFor(center, catalog)
+    const hasGraph = !!catalog.graph && inBounds(center, catalog.graph.coverage)
+    const missing = [!hasMap && 'Maps', !hasGraph && 'routing data'].filter(Boolean).join(' and ')
+    if (missing) setNotice(`${missing} are not available for this location on this server. Automatic area generation is not configured.`)
+    if (hasGraph) {
+      void getRouter(catalog, (loaded, total) => {
+        if (autoDownload.current) setRouteProgress(Math.round(loaded / total * 100))
+      }).then(() => { if (autoDownload.current) setRoutingReady(true) })
+        .catch((error: Error) => { if (active && autoDownload.current) setNotice(error.message) })
+        .finally(() => { if (autoDownload.current) setRouteProgress(null) })
+    }
+    return () => { active = false }
+  }, [center, catalog])
 
   const commit = useCallback((next: RouteDraft, nextLegs: Leg[]) => {
     setHistory((items) => [...items.slice(-19), { draft: draftRef.current, legs }])
@@ -179,10 +205,77 @@ export default function App() {
       .catch((error: Error) => setNotice(error.message))
   }, [hydrated, catalog, draft, legs.length, busy, withEngine])
 
+  const cancelRouteDrag = useCallback(() => {
+    if (!dragSession.current) return
+    dragSession.current.cancel()
+    dragSession.current = null
+    setRoutePreview(null)
+    setBusy(false)
+  }, [])
+
+  useEffect(() => () => { dragSession.current?.cancel() }, [])
+
+  const beginWaypointPreview = (point: Coordinate, waypointIndex: number, kind: RoutePreview['kind']): boolean => {
+    if (busy || dragSession.current) return false
+    const previous = draftRef.current
+    if (waypointIndex < (kind === 'insert' ? 1 : 0) || waypointIndex >= previous.waypoints.length || legs.length !== previous.waypoints.length - 1) return false
+    const id = kind === 'insert' ? crypto.randomUUID() : previous.waypoints[waypointIndex].id
+    setBusy(true)
+    setNotice(null)
+    setRoutePreview({ kind, waypointIndex, waypoint: { id, original: point, snapped: null }, legs: kind === 'move' ? legs : null, pending: true, error: null })
+    const session = latestPreview<Coordinate, { draft: RouteDraft; legs: Leg[] }>(async (original) => {
+      if (catalog?.graph && !inBounds(original, catalog.graph.coverage)) throw new Error('Routing data is unavailable here. Try a point inside downloaded coverage.')
+      return withEngine(async (engine) => {
+        const waypoint = { id, original, snapped: await snapPoint(original, previous.mode, engine) }
+        const waypoints = [...previous.waypoints]
+        waypoints.splice(waypointIndex, kind === 'insert' ? 0 : 1, waypoint)
+        const nextLegs = await updateLegsIncrementally(previous.waypoints, legs, waypoints,
+          (start, end, index) => calculateLeg(start, end, index, previous.mode, engine))
+        return { draft: { ...previous, waypoints }, legs: nextLegs }
+      })
+    }, (result) => {
+      setRoutePreview({ kind, waypointIndex, waypoint: result.draft.waypoints[waypointIndex], legs: result.legs, pending: false, error: null })
+    }, (error) => {
+      setRoutePreview((preview) => preview && { ...preview, legs: null, pending: false, error: error instanceof Error ? error.message : 'No route found here.' })
+    }, (result) => {
+      // Keep routed geometry moving even while the pointer outruns the worker.
+      setRoutePreview((preview) => preview && { ...preview, legs: result.legs })
+    })
+    dragSession.current = session
+    session.update(point)
+    return true
+  }
+
+  const beginRouteDrag = (point: Coordinate, afterId: string) =>
+    beginWaypointPreview(point, draftRef.current.waypoints.findIndex((waypoint) => waypoint.id === afterId), 'insert')
+
+  const beginPointDrag = (point: Coordinate, id: string) =>
+    beginWaypointPreview(point, draftRef.current.waypoints.findIndex((waypoint) => waypoint.id === id), 'move')
+
+  const updateRouteDrag = (point: Coordinate) => {
+    if (!dragSession.current) return
+    setRoutePreview((preview) => preview && { ...preview, waypoint: { ...preview.waypoint, original: point, snapped: null }, pending: true, error: null })
+    dragSession.current.update(point)
+  }
+
+  const finishRouteDrag = async (point: Coordinate | null) => {
+    const session = dragSession.current
+    if (!session) return
+    if (!point) { cancelRouteDrag(); return }
+    updateRouteDrag(point)
+    try {
+      const result = await session.finish()
+      if (dragSession.current === session) commit(result.draft, result.legs)
+    } catch (error) {
+      if (dragSession.current === session) setNotice(error instanceof Error ? error.message : 'Could not add this waypoint.')
+    } finally {
+      if (dragSession.current === session) { dragSession.current = null; setRoutePreview(null); setBusy(false) }
+    }
+  }
+
   const addWaypoint = useCallback(async (point: Coordinate, insertionIndex?: number) => {
     if (busy) return
-    if (!inBounds(point, coverageBounds)) { setNotice('Waypoints are available within the Bay Area for now.'); return }
-    if (catalog?.graph && !inBounds(point, catalog.graph.coverage)) { setNotice('Routing data for this part of the Bay Area is not available yet.'); return }
+    if (catalog?.graph && !inBounds(point, catalog.graph.coverage)) { setNotice('Routing data for this location is not available on this server yet.'); return }
     setBusy(true)
     try {
       const previous = draftRef.current
@@ -191,25 +284,11 @@ export default function App() {
       const waypoints = [...previous.waypoints]
       waypoints.splice(at, 0, waypoint)
       const next = { ...previous, waypoints }
-      const nextLegs = await withEngine((engine) => calculateLegs(waypoints, previous.mode, engine))
+      const nextLegs = await withEngine((engine) => updateLegsIncrementally(previous.waypoints, legs, waypoints, (start, end, index) => calculateLeg(start, end, index, previous.mode, engine)))
       commit(next, nextLegs)
     } catch (error) { setNotice(error instanceof Error ? error.message : 'Could not add this waypoint.') }
     finally { setBusy(false); setRouteProgress(null) }
-  }, [busy, coverageBounds, catalog, withEngine, commit])
-
-  const moveWaypoint = useCallback(async (id: string, point: Coordinate) => {
-    if (busy) return
-    if (catalog?.graph && !inBounds(point, catalog.graph.coverage)) { setNotice('Routing data for this part of the Bay Area is not available yet.'); setMapRevision((value) => value + 1); return }
-    setBusy(true)
-    try {
-      const previous = draftRef.current
-      const snapped = await withEngine((engine) => snapPoint(point, previous.mode, engine))
-      const waypoints = previous.waypoints.map((waypoint) => waypoint.id === id ? { ...waypoint, original: point, snapped } : waypoint)
-      const nextLegs = await withEngine((engine) => calculateLegs(waypoints, previous.mode, engine))
-      commit({ ...previous, waypoints }, nextLegs)
-    } catch (error) { setNotice(error instanceof Error ? error.message : 'Could not move this waypoint.'); setMapRevision((value) => value + 1) }
-    finally { setBusy(false) }
-  }, [busy, catalog, withEngine, commit])
+  }, [busy, catalog, legs, withEngine, commit])
 
   const changeMode = async (mode: Mode) => {
     if (busy || mode === draft.mode) return
@@ -227,8 +306,9 @@ export default function App() {
     if (busy) return
     setBusy(true)
     try {
-      const nextLegs = await withEngine((engine) => calculateLegs(waypoints, draft.mode, engine))
-      commit({ ...draft, waypoints }, nextLegs)
+      const previous = draftRef.current
+      const nextLegs = await withEngine((engine) => updateLegsIncrementally(previous.waypoints, legs, waypoints, (start, end, index) => calculateLeg(start, end, index, previous.mode, engine)))
+      commit({ ...previous, waypoints }, nextLegs)
     } catch (error) { setNotice(error instanceof Error ? error.message : 'Could not update the route.') }
     finally { setBusy(false) }
   }
@@ -237,9 +317,7 @@ export default function App() {
     try {
       const point = await getPosition()
       setCurrentLocation(point)
-      setCenter(point)
-      setFocusZoom(13)
-      await setLastLocation(point)
+      selectLocation(point, 13)
     } catch { setNotice('Location is unavailable. Check your browser location permission.') }
   }
 
@@ -299,8 +377,9 @@ export default function App() {
       setReadyAreas([])
       setCurrentLocation(null)
       setMapTheme('calm')
-      setCenter(BAY_CENTER)
-      setFocusZoom(12.3)
+      setCenter(null)
+      setViewport(null)
+      setRouteProgress(null)
       setRoutingReady(false)
       setMapRevision((value) => value + 1)
       setSettingsOpen(false)
@@ -311,23 +390,23 @@ export default function App() {
   }
 
   return <div className={`app theme-${theme}`}>
-    <MapCanvas theme={theme} center={center} focusZoom={focusZoom} currentLocation={currentLocation} waypoints={draft.waypoints} legs={legs} revision={mapRevision}
+    {center && <MapCanvas preview={routePreview} onBeginRouteDrag={beginRouteDrag} onBeginPointDrag={beginPointDrag} onUpdateRouteDrag={updateRouteDrag} onFinishRouteDrag={(point) => { void finishRouteDrag(point) }} theme={theme} center={center} focusZoom={focusZoom} currentLocation={currentLocation} waypoints={draft.waypoints} legs={legs} revision={mapRevision}
       areas={catalog?.areas} readyAreas={readyAreas} graphCoverage={catalog?.graph?.coverage} routingReady={routingReady} showCoverage={showCoverage}
-      onMapClick={(point, at) => { void addWaypoint(point, at) }} onDragPoint={(id, point) => { void moveWaypoint(id, point) }}
-      onViewport={(point, bounds, zoom) => setViewport({ center: point, bounds, zoom })} onReady={(instance) => { map.current = instance }} />
+      onMapClick={(point, at) => { void addWaypoint(point, at) }}
+      onRemovePoint={(id) => { void changeWaypoints(draftRef.current.waypoints.filter((waypoint) => waypoint.id !== id)) }}
+      onViewport={(point, bounds, zoom) => setViewport({ center: point, bounds, zoom })} onReady={(instance) => { map.current = instance }} />}
 
     <div className="topbar">
       <div className="brand" aria-label="Mappy"><span className="brand-icon"><Navigation size={19} fill="currentColor" /></span><span>Mappy</span></div>
       <div className="search-wrap">
         <Search size={19} className="search-icon" />
-        <input aria-label="Search Bay Area addresses" placeholder="Search Bay Area addresses" value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} />
+        <input aria-label="Search addresses or ZIP codes" placeholder="Search addresses or ZIP codes" value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} />
         {searchQuery && <button className="icon-plain" aria-label="Clear search" onClick={() => { setSearchQuery(''); setSearchResults([]) }}><X size={17} /></button>}
-        {(searchResults.length > 0 || searching) && <div className="search-results">
-          {searching && <p className="search-status">Searching…</p>}
+        {(searchResults.length > 0 || searching || searchError) && <div className="search-results">
+          {searching && <p className="search-status">Searching…</p>}{searchError && <p className="search-status" role="status">{searchError}</p>}
           {searchResults.map((result, index) => <button key={`${result.lat}-${index}`} onClick={() => {
             const point = { lat: result.lat, lon: result.lon }
-            setCenter(point)
-            setFocusZoom(14)
+            selectLocation(point, 14)
             setSearchQuery('')
             setSearchResults([])
           }}><span className="result-icon"><Search size={16} /></span><span><strong>{result.name}</strong><small>{result.detail}</small></span></button>)}
@@ -341,7 +420,8 @@ export default function App() {
       <div className="panel-content">
         <div className="panel-heading"><div><span className="eyebrow">ROUTE PLANNER</span><h1>Your route</h1></div><button className="icon-plain more-button" aria-label="Open settings" onClick={() => setSettingsOpen(true)}><MoreHorizontal /></button></div>
         <div className="mode-switch" role="group" aria-label="Travel mode">{modeOptions.map(({ value, label, icon: Icon }) => <button key={value} disabled={busy} className={draft.mode === value ? 'active' : ''} onClick={() => { void changeMode(value) }}><Icon size={18} /><span>{label}</span></button>)}</div>
-        <div className="route-total"><span>Total distance</span><strong>{legs.length ? formatDistance(totalKm) : '—'}</strong><small>{draft.waypoints.length < 2 ? 'Add at least two points to see a route' : `${draft.waypoints.length} stops · ${legs.length} leg${legs.length === 1 ? '' : 's'}`}</small></div>
+        <div className="route-total"><span>Total distance</span><strong>{legs.length ? formatDistance(totalKm) : '—'}</strong><small>{routePreview ? (routePreview.kind === 'move' ? 'Route preview · release to move this stop' : 'Route preview · release to add this stop') : draft.waypoints.length < 2 ? 'Add at least two points to see a route' : `${draft.waypoints.length} stops · ${legs.length} leg${legs.length === 1 ? '' : 's'}`}</small></div>
+        {draft.waypoints.length > 0 && <p className="route-hint">Click to add the next stop · Drag a route to add a stop · Right-click for options</p>}
         <div className="waypoints-list">
           {draft.waypoints.length === 0 ? <div className="empty-route"><div className="empty-icon"><Plus size={23} /></div><strong>Start with a point on the map</strong><p>Click anywhere to add your first waypoint. Add more to calculate a route.</p><button onClick={() => { if (currentLocation) void addWaypoint(currentLocation); else void recenter() }}><LocateFixed size={16} /> Use my location</button></div> : draft.waypoints.map((waypoint, index) => <div className="waypoint-row" key={waypoint.id}>
             <span className={`waypoint-number ${index === 0 ? 'start' : ''}`}>{index + 1}</span>
@@ -358,15 +438,18 @@ export default function App() {
     </aside>
 
     <div className="map-controls">
+      <button className="map-control" title="Choose starting area" aria-label="Choose starting area" onClick={() => setLocationPickerOpen(true)}><LocateFixed size={20} /></button>
       <div className="control-popover-wrap"><button className="map-control" title="Map style" aria-label="Choose map style" onClick={() => setThemeOpen(!themeOpen)}><Layers3 size={20} /></button>{themeOpen && <div className="theme-menu">{(['calm', 'classic', 'dark'] as Theme[]).map((option) => <button key={option} onClick={() => { setMapTheme(option); setThemeOpen(false) }}><span className={`theme-swatch ${option}`} />{themeNames[option]}{theme === option && <Check size={16} />}</button>)}</div>}</div>
       <div className="control-popover-wrap"><button className={`map-control ${showCoverage ? 'coverage-active' : ''}`} title="Offline coverage" aria-label={showCoverage ? 'Hide offline coverage' : 'Show offline coverage'} aria-pressed={showCoverage} onClick={() => setShowCoverage(!showCoverage)}><MapIcon size={20} /></button>{showCoverage && <div className="coverage-legend" aria-label="Offline coverage legend"><strong>OFFLINE COVERAGE</strong><span><i className="coverage-key both" /> Map + routing</span><span><i className="coverage-key map" /> Map only</span><span><i className="coverage-key graph" /> Routing only</span><span><i className="coverage-key missing" /> Not downloaded</span></div>}</div>
       <button className="map-control" title="My location" aria-label="Go to my location" onClick={() => { void recenter() }}><Crosshair size={20} /></button>
       <div className="zoom-controls"><button className="map-control" aria-label="Zoom in" onClick={() => map.current?.zoomIn()}><Plus size={20} /></button><button className="map-control" aria-label="Zoom out" onClick={() => map.current?.zoomOut()}><span className="minus">−</span></button></div>
     </div>
 
-    <div className="status-bar"><span className={`status-indicator ${readyAreas.length ? 'ready' : ''}`} />{readyAreas.length ? `${readyAreas.length} map area${readyAreas.length === 1 ? '' : 's'} offline` : 'Map data needed'}<span className="status-separator">·</span>{routingReady ? 'Routing offline' : 'Routing data needed'}</div>
-    {(areaProgress || routeProgress !== null || busy) && <div className="progress-toast"><span className="spinner" />{areaProgress ? `${areaProgress.label} · ${areaProgress.percent}%` : routeProgress !== null ? `Saving routing data (${formatStorage(catalog?.graph?.files.reduce((sum, file) => sum + file.bytes, 0) ?? 0)}) · ${routeProgress}%` : 'Calculating route…'}</div>}
+    <div className="status-bar"><span className={`status-indicator ${readyAreas.length ? 'ready' : ''}`} />{readyAreas.length ? `${readyAreas.length} map area${readyAreas.length === 1 ? '' : 's'} offline` : 'Map data needed'}<span className="status-separator">·</span>{routingReady ? (center && catalog?.graph && inBounds(center, catalog.graph.coverage) ? 'Routing offline here' : 'Routing saved elsewhere') : 'Routing data needed'}</div>
+    {(areaProgress || routeProgress !== null || busy) && <div className="progress-toast"><span className="spinner" />{areaProgress ? `${areaProgress.label} · ${areaProgress.percent}%` : routeProgress !== null ? `Saving routing data (${formatStorage(catalog?.graph?.files.reduce((sum, file) => sum + file.bytes, 0) ?? 0)}) · ${routeProgress}%` : routePreview ? (routePreview.error ?? (routePreview.pending ? 'Updating dragged route…' : 'Release to keep waypoint · Esc to cancel')) : 'Calculating route…'}</div>}
     {notice && <div className="notice" role="status"><span>{notice}</span><button aria-label="Dismiss message" onClick={() => setNotice(null)}><X size={16} /></button></div>}
+
+    {(locating || locationPickerOpen) && <LocationPicker locating={locating} onSelect={selectLocation} onClose={center ? () => setLocationPickerOpen(false) : undefined} />}
 
     {settingsOpen && <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setSettingsOpen(false) }}><div className="dialog" role="dialog" aria-modal="true" aria-label="Settings"><div className="dialog-heading"><h2>Privacy & storage</h2><button className="icon-plain" aria-label="Close settings" onClick={() => setSettingsOpen(false)}><X size={20} /></button></div><p>Routes and downloaded maps stay on this device. Address searches go to this app’s server.</p><div className="storage-row"><span><strong>Offline map areas</strong><small>{readyAreas.length} downloaded</small></span><span><strong>Routing data</strong><small>{routingReady ? 'Ready offline' : 'Not downloaded'}</small></span></div><button className="dialog-action" onClick={() => importInput.current?.click()}><Upload size={18} /> Import route</button><input ref={importInput} type="file" accept="application/json,.json" hidden onChange={(event) => { const file = event.target.files?.[0]; if (file) void importRoute(file); event.target.value = '' }} /><button className="dialog-action danger" onClick={() => setClearConfirm(true)}><Trash2 size={18} /> Clear all app data</button><p className="footnote">Location permission is managed in your browser or device settings.</p></div></div>}
     {clearConfirm && <div className="dialog-backdrop"><div className="dialog confirm-dialog" role="alertdialog" aria-modal="true" aria-label="Clear all app data"><div className="danger-icon"><Trash2 size={22} /></div><h2>Clear all app data?</h2><p>This removes routes, your last location, map style, downloaded maps, routing data, and offline app files from this browser. This cannot be undone.</p><div className="confirm-actions"><button onClick={() => setClearConfirm(false)}>Cancel</button><button className="danger-button" disabled={busy} onClick={() => { void clearEverything() }}>Clear all data</button></div></div></div>}

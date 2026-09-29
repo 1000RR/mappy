@@ -5,8 +5,7 @@ import { resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
 const input = process.argv[2]
-if (!input) throw new Error('Usage: node scripts/build-search-index.mjs /path/to/bay.geojsonseq')
-const bounds = [-123.15, 36.88, -121.38, 38.88]
+if (!input) throw new Error('Usage: node scripts/build-search-index.mjs /path/to/area.geojsonseq')
 await mkdir(resolve('data'), { recursive: true })
 const output = resolve('data/search.sqlite')
 const temporary = resolve('data/search.sqlite.tmp')
@@ -37,11 +36,11 @@ for await (const line of createInterface({ input: createReadStream(input) })) {
   const feature = JSON.parse(line.replace(/^\x1e/, ''))
   const tags = feature.properties ?? {}
   const address = [tags['addr:housenumber'], tags['addr:street']].filter(Boolean).join(' ')
-  const name = String(address || tags.name || '').trim()
+  const name = String(address || tags.name || tags['addr:postcode'] || tags.postal_code || '').trim()
   if (name.length < 3 || name.length > 120) continue
   const [lon, lat] = pointOf(feature.geometry)
-  if (!Number.isFinite(lat) || !Number.isFinite(lon) || lon < bounds[0] || lon > bounds[2] || lat < bounds[1] || lat > bounds[3]) continue
-  const detail = [tags['addr:city'] || tags['is_in:city'], tags['addr:state'] || 'CA'].filter(Boolean).join(', ')
+  if (!Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lon) > 180 || Math.abs(lat) > 90) continue
+  const detail = [tags['addr:city'] || tags['is_in:city'], tags['addr:state'], tags['addr:postcode'] || tags.postal_code, tags['addr:country']].filter(Boolean).join(', ')
   insert.run(name, detail, lat, lon)
   count++
   if (count % 10000 === 0) database.exec('COMMIT; BEGIN')
@@ -50,4 +49,4 @@ database.exec('COMMIT')
 database.exec("INSERT INTO search_fts(search_fts) VALUES('rebuild')")
 database.close()
 await rename(temporary, output)
-console.log(`Indexed ${count} Bay Area places and addresses in data/search.sqlite`)
+console.log(`Indexed ${count} places and addresses in data/search.sqlite`)

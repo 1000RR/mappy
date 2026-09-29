@@ -1,7 +1,7 @@
 {
-  "name": "Mappy — Bay Area route planner",
+  "name": "Mappy — route planner",
   "short_name": "Mappy",
-  "description": "Plan private driving, cycling, and walking routes in the Bay Area.",
+  "description": "Plan private driving, cycling, and walking routes with offline maps.",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#f7f6f2",

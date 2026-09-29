@@ -7,6 +7,7 @@ import type { Coordinate, DataManifest, Leg, Mode, Waypoint } from './types'
 
 let router: Router | null = null
 let routerPromise: Promise<Router> | null = null
+let downloadController = new AbortController()
 
 async function controlledByServiceWorker() {
   if (!('serviceWorker' in navigator) || !import.meta.env.PROD) return
@@ -21,7 +22,7 @@ async function controlledByServiceWorker() {
 export async function getRouter(catalog: DataManifest, onProgress?: (loaded: number, total: number) => void): Promise<Router> {
   if (router) return router
   routerPromise ??= (async () => {
-    await ensureGraph(catalog, onProgress)
+    await ensureGraph(catalog, onProgress, downloadController.signal)
     await controlledByServiceWorker()
     if (!catalog.graph) throw new Error('Routing data is unavailable')
     const next = new Router({
@@ -40,9 +41,12 @@ export async function getRouter(catalog: DataManifest, onProgress?: (loaded: num
 }
 
 export async function releaseRouter(): Promise<void> {
+  downloadController.abort()
+  if (routerPromise) await routerPromise.catch(() => undefined)
   if (router) await router.dispose()
   router = null
   routerPromise = null
+  downloadController = new AbortController()
 }
 
 async function nativeLeg(start: Coordinate, end: Coordinate, mode: Mode, engine: Router) {
@@ -90,8 +94,12 @@ export async function calculateLegs(waypoints: Waypoint[], mode: Mode, engine: R
     const start = waypoints[index].snapped
     const end = waypoints[index + 1].snapped
     if (!start || !end) continue
-    const leg = await nativeLeg(start, end, mode, engine)
-    legs.push({ index, ...leg })
+    legs.push(await calculateLeg(waypoints[index], waypoints[index + 1], index, mode, engine))
   }
   return legs
+}
+
+export async function calculateLeg(start: Waypoint, end: Waypoint, index: number, mode: Mode, engine: Router): Promise<Leg> {
+  if (!start.snapped || !end.snapped) throw new Error('A waypoint has not been snapped to a road or path.')
+  return { index, ...await nativeLeg(start.snapped, end.snapped, mode, engine) }
 }

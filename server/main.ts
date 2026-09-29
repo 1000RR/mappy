@@ -8,13 +8,12 @@ import { DatabaseSync } from 'node:sqlite'
 
 const dataDir = resolve(process.env.DATA_DIR ?? join(process.cwd(), 'data'))
 const webDir = resolve(process.cwd(), 'dist')
-const bayBounds = [-123.15, 36.88, -121.38, 38.88]
 
 @Injectable()
 class DataService {
   manifest() {
     const filename = join(dataDir, 'manifest.json')
-    if (!existsSync(filename)) return { version: 'unavailable', bounds: bayBounds, areas: [], graph: null }
+    if (!existsSync(filename)) return { version: 'unavailable', bounds: null, areas: [], graph: null }
     return JSON.parse(readFileSync(filename, 'utf8')) as unknown
   }
 }
@@ -77,15 +76,14 @@ class ApiController {
     const target = new URL('/api', process.env.PHOTON_URL)
     target.searchParams.set('q', query)
     target.searchParams.set('limit', '6')
-    target.searchParams.set('bbox', bayBounds.join(','))
     try {
       const response = await fetch(target, { signal: AbortSignal.timeout(5000) })
       if (!response.ok) throw new Error(`Photon status ${response.status}`)
       const body = await response.json() as { features?: Array<{ geometry: { coordinates: [number, number] }, properties: Record<string, string> }> }
       return {
         results: (body.features ?? []).map((feature) => ({
-          name: feature.properties.name ?? [feature.properties.housenumber, feature.properties.street].filter(Boolean).join(' '),
-          detail: [feature.properties.city, feature.properties.state].filter(Boolean).join(', '),
+          name: feature.properties.name || [feature.properties.housenumber, feature.properties.street].filter(Boolean).join(' ') || feature.properties.postcode || query,
+          detail: [feature.properties.city, feature.properties.state, feature.properties.postcode, feature.properties.country].filter(Boolean).join(', '),
           lon: feature.geometry.coordinates[0],
           lat: feature.geometry.coordinates[1]
         }))

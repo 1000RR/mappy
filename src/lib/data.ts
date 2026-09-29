@@ -65,12 +65,12 @@ export async function getMapTile(z: number, x: number, y: number, signal?: Abort
   return new ArrayBuffer(0)
 }
 
-export async function ensureGraph(catalog: DataManifest, onProgress?: (loaded: number, total: number) => void): Promise<void> {
+export async function ensureGraph(catalog: DataManifest, onProgress?: (loaded: number, total: number) => void, signal?: AbortSignal): Promise<void> {
   if (!catalog.graph) throw new Error('Offline routing data has not been installed on this server yet.')
   const total = catalog.graph.files.reduce((sum, file) => sum + file.bytes, 0)
   let complete = 0
   for (const file of catalog.graph.files) {
-    await downloadAsset(file, (loaded) => onProgress?.(complete + loaded, total))
+    await downloadAsset(file, (loaded) => onProgress?.(complete + loaded, total), signal)
     complete += file.bytes
     onProgress?.(complete, total)
   }
